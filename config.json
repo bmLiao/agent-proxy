@@ -1,0 +1,5 @@
+{
+  "flush_interval": 3,
+  "show_tool_calls": false,
+  "cli_approval_timeout": 600
+}

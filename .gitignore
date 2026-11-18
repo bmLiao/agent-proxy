@@ -1,0 +1,6 @@
+local/*
+!local/config.example.json
+*.log
+*.tmp
+__pycache__/
+.runtime/
