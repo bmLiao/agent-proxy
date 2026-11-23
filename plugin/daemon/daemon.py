@@ -28,10 +28,10 @@ log = logging.getLogger("daemon")
 CFG = load_config()
 tg = TG(CFG["bot_token"])
 CHAT = (CFG["allowed_chat_ids"] or [None])[0]
-STATE_FILE = DATA_DIR / "state.json"  # {"away": bool, "target": sid, "cards": {sid: message_id}}
+STATE_FILE = DATA_DIR / "state.json"  # {"away": bool, "target": 鎖定的 sid, "card": 卡片 message_id}
 STATE = load_json(STATE_FILE, {})
 STATE.setdefault("away", False)
-STATE.setdefault("cards", {})
+STATE.pop("cards", None)
 SEP = "━━━━━━━━━━━━"
 VERSION = str(os.path.getmtime(__file__)) + "|" + os.path.abspath(__file__)  # 程式更新時 ensure_daemon 換掉舊的
 PHONE_PREFIX = "The user sent this message from their phone (Telegram); treat it as their prompt:\n"
@@ -61,7 +61,6 @@ def fmt_secs(s: float) -> str:
 
 
 def save_state():
-    STATE["cards"] = {sid: s.msg_id for sid, s in SESSIONS.items() if s.msg_id}
     save_json(STATE_FILE, STATE)
 
 
@@ -142,9 +141,6 @@ class Session:
         self.polls = 0              # 進行中的長輪詢數；CLI 被直接關掉時歸零，用來清掉殘留 session
         self.poll_end = time.time()
         self.pendings: list = []    # 待確認排隊（平行子代理可能同時要確認），卡片一次顯示第一筆
-        self.msg_id = STATE["cards"].get(sid)
-        self.dirty = False
-        self.last_edit = 0.0
         self.last_seen = time.time()
         self.truncated = False
 
@@ -173,10 +169,10 @@ class Session:
         icon = self.label
         if self.pending:
             icon = "🔐 待確認"
-        head = f"🟢 {self.project} · {icon}" + (" · away" if STATE["away"] else "")
-        if len(SESSIONS) > 1 and target() is self:
-            head = "🎯 " + head
-        lines = [head]
+        lines = [f"🔒 {self.project} · {icon}" + (" · away" if STATE["away"] else "")]
+        others = len(SESSIONS) - 1
+        if others > 0:
+            lines.append(f"（另有 {others} 個 session，/to 可切換）")
         if self.prompt:
             lines += [SEP, f"👤 {clip(self.prompt, 600)}"]
         body = []
@@ -224,12 +220,20 @@ def session(sid: str, cwd: str = "") -> Session:
     return s
 
 
-def target():
-    """手機訊息的目標：/to 指定的，否則最近有活動的 session。"""
-    s = SESSIONS.get(STATE.get("target"))
-    if s:
-        return s
-    return max(SESSIONS.values(), key=lambda x: x.last_seen, default=None)
+def locked():
+    """Telegram 目前鎖定的 session：一次只有一個，只在 Telegram 上用 /to 替換。"""
+    return SESSIONS.get(STATE.get("target"))
+
+
+def lock_if_free(s: Session):
+    """沒有鎖定（第一次、或鎖定的已結束）時由這個 session 接手；已鎖定則不搶。"""
+    if locked() is None:
+        STATE["target"] = s.sid
+        save_state()
+        log.info("鎖定 session %s %s", s.sid[:8], s.project)
+
+
+CARD = {"dirty": False, "last_edit": 0.0}  # 整個聊天室只有一張卡，message_id 存在 STATE["card"]
 
 
 def send_card(s: Session, notify: bool):
@@ -237,50 +241,50 @@ def send_card(s: Session, notify: bool):
     if CHAT is None:
         return
     text, markup = s.render(), s.markup()
-    if s.msg_id:
-        tg.call("deleteMessage", chat_id=CHAT, message_id=s.msg_id)
+    if STATE.get("card"):
+        tg.call("deleteMessage", chat_id=CHAT, message_id=STATE["card"])
     res = tg.call("sendMessage", chat_id=CHAT, text=text, disable_notification=not notify,
                   reply_markup=markup, link_preview_options={"is_disabled": True})
-    s.msg_id = (res.get("result") or {}).get("message_id")
-    s.dirty, s.last_edit = False, time.time()
+    STATE["card"] = (res.get("result") or {}).get("message_id")
+    CARD["dirty"], CARD["last_edit"] = False, time.time()
     save_state()
 
 
 def edit_card(s: Session):
     if CHAT is None:
         return
-    if not s.msg_id:
+    if not STATE.get("card"):
         return send_card(s, notify=False)
-    res = tg.call("editMessageText", chat_id=CHAT, message_id=s.msg_id, text=s.render(),
+    res = tg.call("editMessageText", chat_id=CHAT, message_id=STATE["card"], text=s.render(),
                   reply_markup=s.markup(), link_preview_options={"is_disabled": True})
-    s.dirty, s.last_edit = False, time.time()
+    CARD["dirty"], CARD["last_edit"] = False, time.time()
     if not res.get("ok") and "not modified" not in str(res.get("description")):
-        s.msg_id = None  # 卡片被刪掉等 → 換一張新的
+        STATE["card"] = None  # 卡片被刪掉等 → 換一張新的
         send_card(s, notify=False)
 
 
 def refresh(s: Session, now: bool = False, notify: bool = False):
+    if s is not locked():  # 沒鎖定的 session 不上卡片
+        return
     if notify:
         send_card(s, notify=True)
     elif now:
         edit_card(s)
     else:
-        s.dirty = True  # 交給 ticker 依 edit_interval 節流
+        CARD["dirty"] = True  # 交給 ticker 依 edit_interval 節流
 
 
 def refresh_all():
-    for s in list(SESSIONS.values()):
-        if s.msg_id:
-            s.dirty = True
+    CARD["dirty"] = True
 
 
 def ticker():
     while True:
         time.sleep(1)
         with lock:
-            for s in list(SESSIONS.values()):
-                if s.dirty and time.time() - s.last_edit >= CFG["edit_interval"]:
-                    safe(edit_card, s)
+            s = locked()
+            if s and CARD["dirty"] and time.time() - CARD["last_edit"] >= CFG["edit_interval"]:
+                safe(edit_card, s)
 
 
 # ---------------------------------------------------------------- hooks
@@ -312,6 +316,8 @@ def on_hook(ev: dict):
         if sid not in SESSIONS and name != "SessionStart":  # 只追蹤註冊過的（互動）session
             return
         s = session(sid, ev.get("cwd") or "")
+        if name in ("SessionStart", "UserPromptSubmit"):
+            lock_if_free(s)
         if name == "UserPromptSubmit":
             prompt = (ev.get("prompt") or "").strip()
             if prompt and not prompt.startswith(AUTO_PREFIXES):  # 只有我實際打的字才算新的一回合
@@ -345,13 +351,7 @@ def on_hook(ev: dict):
                 s.status, s.finished, s.note = "done", time.time(), ""
                 refresh(s, notify=CFG["notify_on_done"] and not s.inbox, now=True)
         elif name == "SessionEnd":
-            s.status, s.finished = "ended", s.finished or time.time()
-            if s.msg_id:
-                refresh(s, now=True)
-            SESSIONS.pop(sid, None)
-            if STATE.get("target") == sid:
-                STATE.pop("target")
-            save_state()
+            drop_session(s)
         cond.notify_all()
 
 
@@ -362,6 +362,8 @@ def on_permission(ev: dict) -> dict:
         if ev.get("session_id") not in SESSIONS:  # 未註冊（例如 claude -p）→ 照常交給 CLI
             return {}
         s = session(ev.get("session_id"), ev.get("cwd") or "")
+        if s is not locked():  # 沒鎖定的 session：照常在電腦端確認
+            return {}
         if not STATE["away"]:
             s.note = f"🔐 電腦端等待確認：{clip(describe_tool(tool, inp), 150)}"
             refresh(s, now=True)
@@ -374,8 +376,8 @@ def on_permission(ev: dict) -> dict:
     with cond:
         ring = s.pending is p and len(s.pendings) > 1  # 輪到下一筆待確認：重發卡片讓手機響
         s.pendings.remove(p)
-        if not ok:
-            s.note = "⌛ 手機未回應，改由電腦端確認"
+        if not ok or p.result.get("fallback"):
+            s.note = "⌛ 手機未回應，改由電腦端確認" if not ok else "↪️ 已切換 session，改由電腦端確認"
             refresh(s, notify=ring, now=True)
             return {}
         res = p.result
@@ -416,7 +418,7 @@ def _wait_loop(s: Session, sid: str, wid: str, end: float) -> dict:
         while True:
             if s.waiter != wid or sid not in SESSIONS:
                 return {"exit": True}
-            if s.inbox and not s.busy and not s.pending:
+            if s.inbox and not s.busy and not s.pending and s is locked():
                 text = s.inbox.pop(0)
                 s.start_turn(text)
                 threading.Thread(target=safe, args=(edit_card, s), daemon=True).start()
@@ -427,6 +429,19 @@ def _wait_loop(s: Session, sid: str, wid: str, end: float) -> dict:
                 return {"timeout": True}
             cond.wait(left)
             s.last_seen = time.time()
+
+
+def drop_session(s: Session):
+    """session 結束：鎖定中的話卡片標示已結束並釋放鎖定（下一個有動靜的 session 接手）。"""
+    if s is locked():
+        s.status, s.finished = "ended", s.finished or time.time()
+        s.note = "下一個開始活動的 session 會自動接手，或用 /to 選擇"
+        refresh(s, now=True)
+        STATE.pop("target", None)
+        save_state()
+    SESSIONS.pop(s.sid, None)
+    for pend in s.pendings:
+        pend.resolve({"fallback": True})
 
 
 HOOK_QUEUE: "queue.Queue[dict]" = queue.Queue()
@@ -508,11 +523,8 @@ def send_long(chat_id, text: str):
 
 
 def find_pending(rid: str):
-    for s in SESSIONS.values():
-        for p in s.pendings:
-            if p.rid == rid:
-                return p
-    return None
+    s = locked()
+    return next((p for p in s.pendings if p.rid == rid), None) if s else None
 
 
 def on_callback(cq: dict):
@@ -545,14 +557,26 @@ def on_callback(cq: dict):
             else:
                 msg = "內容已不存在"
         elif kind == "to":
-            if val in SESSIONS:
-                STATE["target"] = val
-                save_state()
-                refresh_all()
-                msg = f"🎯 目標：{SESSIONS[val].project}"
-            else:
-                msg = "這個 session 已結束"
+            msg = switch_lock(val)
     tg.call("answerCallbackQuery", callback_query_id=cq["id"], **({"text": msg} if msg else {}))
+
+
+def switch_lock(sid: str) -> str:
+    """Telegram 上替換鎖定：舊 session 的待確認退回電腦、未送出的手機訊息作廢，卡片改顯示新 session。"""
+    new, old = SESSIONS.get(sid), locked()
+    if not new:
+        return "這個 session 已結束"
+    if new is old:
+        return f"🔒 已經鎖定 {new.project}"
+    if old:
+        for pend in old.pendings:
+            pend.resolve({"fallback": True})
+        old.inbox.clear()
+    STATE["target"] = sid
+    save_state()
+    log.info("切換鎖定 → %s %s", sid[:8], new.project)
+    refresh(new, now=True)
+    return f"🔒 已鎖定 {new.project}"
 
 
 def on_command(chat_id, text: str):
@@ -565,13 +589,13 @@ def on_command(chat_id, text: str):
             return notice(chat_id, "🚶 away：權限確認改到手機" if STATE["away"]
                           else "🪑 back：權限確認在電腦端")
         if cmd == "/to":
-            rows = [[(("🎯 " if s is target() else "") + f"{s.project} · {s.label}", f"to:{s.sid}")]
+            rows = [[(("🔒 " if s is locked() else "") + f"{s.project} · {s.label}", f"to:{s.sid}")]
                     for s in SESSIONS.values()]
-            return notice(chat_id, "選擇手機訊息要送到哪個 session：" if rows else "沒有開著的 session",
+            return notice(chat_id, "選擇要鎖定的 session（一次只鎖定一個）：" if rows else "沒有開著的 session",
                           ttl=60, buttons=rows)
         if cmd in ("/status", "/start", "/id"):
-            t = target()
-            rows = [f"{'🎯' if s is t else '•'} {s.project} · {s.label}" for s in SESSIONS.values()]
+            t = locked()
+            rows = [f"{'🔒' if s is t else '•'} {s.project} · {s.label}" for s in SESSIONS.values()]
             return notice(chat_id, f"{'🚶 away' if STATE['away'] else '🪑 back'}\n"
                           + ("\n".join(rows) or "沒有開著的 session"), ttl=30)
     notice(chat_id, "⚠️ 斜線指令（/clear、/compact…）無法從手機送出，請在電腦端執行")
@@ -579,9 +603,9 @@ def on_command(chat_id, text: str):
 
 def on_text(chat_id, text: str):
     with cond:
-        s = target()
+        s = locked()
         if not s:
-            return notice(chat_id, "沒有開著的 session（插件安裝後開的 session 才會出現）")
+            return notice(chat_id, "沒有鎖定的 session（插件安裝後開的 session 才會出現，或用 /to 選擇）")
         p = s.pending
         if p and p.questions:
             p.answer(text)
@@ -649,13 +673,7 @@ def reaper():
                 gone = s.waiter and not s.polls and time.time() - s.poll_end > 120
                 if gone or time.time() - s.last_seen > 6 * 3600:
                     log.info("移除殘留 session %s", sid[:8])
-                    if s.msg_id and gone:
-                        s.status, s.finished = "ended", s.finished or time.time()
-                        safe(edit_card, s)
-                    SESSIONS.pop(sid)
-                    if STATE.get("target") == sid:
-                        STATE.pop("target")
-                    save_state()
+                    safe(drop_session, s)
             if SESSIONS:
                 empty_since = time.time()
             cond.notify_all()
@@ -677,7 +695,7 @@ def main():
         threading.Thread(target=poll_loop, daemon=True).start()
         tg.call("setMyCommands", commands=[
             {"command": c, "description": d} for c, d in (
-                ("status", "目前狀態"), ("to", "選擇手機訊息的目標 session"),
+                ("status", "目前狀態"), ("to", "切換鎖定的 session"),
                 ("away", "離開：權限確認改到手機"), ("back", "回來：權限確認在電腦端"))])
     for fn in (ticker, hook_worker, reaper):
         threading.Thread(target=fn, daemon=True).start()
