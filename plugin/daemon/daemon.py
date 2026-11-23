@@ -18,7 +18,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tgapi import DATA_DIR, MAX_LEN, TG, code_version, load_config, load_json, save_json  # noqa: E402
+from tgapi import DATA_DIR, MAX_LEN, TG, code_version, load_config, load_json, pid_alive, save_json  # noqa: E402
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=str(DATA_DIR / "daemon.log"), encoding="utf-8",
@@ -161,6 +161,7 @@ class Session:
         self.waiter = None          # 目前在長輪詢的 wait_phone id
         self.polls = 0              # 進行中的長輪詢數；CLI 被直接關掉時歸零，用來清掉殘留 session
         self.poll_end = time.time()
+        self.pid = 0                # Claude Code CLI 的 PID（wait_phone 帶來）；判斷視窗是否真的關了
         self.pendings: list = []    # 待確認排隊（平行子代理可能同時要確認），卡片一次顯示第一筆
         self.last_seen = time.time()
         self.last_event = time.time()  # 最後一個 hook 事件（判斷忙碌用；waiter 輪詢不算）
@@ -478,13 +479,14 @@ def on_permission(ev: dict) -> dict:
 ENDED: set = set()  # 已結束的 session，殘留的 waiter 不能把它復活
 
 
-def wait_phone(sid: str, wid: str, cwd: str, timeout: float = 50) -> dict:
+def wait_phone(sid: str, wid: str, cwd: str, pid: int = 0, timeout: float = 50) -> dict:
     """wait_phone 的長輪詢：有手機訊息且 session 不忙時交給它；新的 waiter 會取代舊的。"""
     end = time.time() + timeout
     with cond:
         if sid in ENDED:
             return {"exit": True}
         s = session(sid, cwd)
+        s.pid = pid or s.pid
         if s.waiter != wid:
             s.waiter = wid
             cond.notify_all()
@@ -550,7 +552,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         if url.path == "/wait":
-            return self.reply(wait_phone(q.get("sid", "?"), q.get("wid", ""), q.get("cwd", "")))
+            return self.reply(wait_phone(q.get("sid", "?"), q.get("wid", ""), q.get("cwd", ""),
+                                         int(q.get("pid") or 0) if (q.get("pid") or "").isdigit() else 0))
         if url.path == "/quit":  # ensure_daemon 發現版本不符時要求退出
             self.reply({"ok": True})
             log.info("收到 /quit，daemon 結束（版本更新）")
@@ -786,14 +789,20 @@ def poll_loop():
 
 # ---------------------------------------------------------------- 生命週期
 def reaper():
-    """清掉殘留 session（waiter 停止輪詢超過 30 秒，或 6 小時沒動靜）；沒有 session 超過 idle_exit 秒就結束。"""
+    """清掉殘留 session（CLI 程序已不在；不知道 PID 時退回：閒置中 waiter 停止輪詢超過 30 秒，或 6 小時沒動靜）；
+    沒有 session 超過 idle_exit 秒就結束。
+    注意：送出手機訊息到下一個 Stop 之間本來就沒有 waiter（Claude 正在處理），不能當成視窗已關。"""
     empty_since = time.time()
     while True:
         time.sleep(30)
         with cond:
             for sid, s in list(SESSIONS.items()):
-                gone = s.waiter and not s.polls and time.time() - s.poll_end > 30
-                if gone or time.time() - s.last_seen > 6 * 3600:
+                if s.pid:
+                    gone = not pid_alive(s.pid)
+                else:
+                    gone = (s.waiter and not s.polls and time.time() - s.poll_end > 30
+                            and s.status not in ("busy", "sent", "bg")) or time.time() - s.last_seen > 6 * 3600
+                if gone:
                     log.info("移除殘留 session %s", sid[:8])
                     safe(drop_session, s)
             if SESSIONS:

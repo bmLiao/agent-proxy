@@ -21,11 +21,11 @@ def main():
     ev = json.loads(sys.stdin.buffer.read() or b"{}")
     if ev.get("agent_id") or unattended():
         return 0
+    claude_pid = int(os.environ.get("CLAUDE_PID") or 0)
     query = urllib.parse.urlencode({"sid": ev.get("session_id", "?"), "cwd": ev.get("cwd", ""),
-                                    "wid": secrets.token_hex(6)})
+                                    "wid": secrets.token_hex(6), "pid": claude_pid})
     url = f"http://127.0.0.1:{load_config()['port']}/wait?{query}"
     end = time.time() + 12 * 3600
-    claude_pid = int(os.environ.get("CLAUDE_PID") or 0)
     while time.time() < end:
         if claude_pid and not pid_alive(claude_pid):  # CLI 已關閉
             return 0

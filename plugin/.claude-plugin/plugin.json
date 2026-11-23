@@ -1,6 +1,6 @@
 {
   "name": "agent-proxy",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "用 Telegram 遠端監控、確認、輸入已開著的 Claude Code session",
   "author": { "name": "BM.Liao" },
   "userConfig": {
