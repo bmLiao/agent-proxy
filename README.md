@@ -1,5 +1,35 @@
 # agent-proxy：用 Telegram 遙控 Claude Code
 
+## 新版：Channel 模式（建議）
+
+```
+手機 Telegram ⇄ channel.py（MCP Channel 伺服器，隨 CLI 啟動/結束）⇄ 這一個 claude session
+```
+
+不需要接管、不打字進終端機、不用常駐 relay，也不改任何全域設定：
+
+- 電腦照常使用；手機直接打字 = 對 Claude 說話（Claude 執行中會排到下一輪）
+- 權限確認：電腦視窗與手機按鈕**同時有效，先按先贏**；手機直接回文字 = 拒絕並改給指示
+- 電腦端輸入、📋 Todo、回合完成的回覆自動推到手機（`show_tool_calls: true` 可看每個工具呼叫）
+- 子代理內部事件不轉播
+
+使用：
+
+1. 照下方「安裝」第 1、2 步設定 `local/config.json`（bot_token、白名單）。
+2. 用 `python cctg.py` 取代 `claude` 啟動（其他參數照傳，例如 `python cctg.py --resume`）。
+   Git Bash 可加 alias：`alias cctg='python ~/agent-proxy/cctg.py'`。
+3. Channels 是研究預覽功能，自訂 channel 每次啟動 Claude Code 會請你確認一次。
+
+限制：
+- 需 Claude Code 2.1.234+、用 claude.ai 帳號或 Console API Key 登入；只支援互動模式（`-p` 不會收手機訊息）。
+- `/clear`、`/compact` 等斜線指令與 Esc 中斷無法從手機送出。
+- 同一個 bot 同時只能有一個 `cctg`（或舊版 relay.py）在收訊息。
+- log 在 `local/channel.log`。
+
+---
+
+## 舊版：relay 接管模式（Windows 限定）
+
 ```
 手機 Telegram ⇄ relay.py ⇄ 電腦上開著的互動式 CLI（cli_hook.py 登記 + 主控台打字）
 ```
