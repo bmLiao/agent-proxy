@@ -21,6 +21,7 @@ DEFAULTS = {
     "edit_interval": 3,       # 卡片 edit 最小間隔秒數
     "notify_on_done": True,   # 完成時刪卡重發（手機會響）；False 只 edit
     "idle_exit": 600,         # 沒有任何 session 後幾秒自動結束
+    "away_timeout": 600,      # away 時手機幾秒沒回應就退回電腦確認
 }
 
 
@@ -29,11 +30,24 @@ def config_paths():
     return [DATA_DIR / "config.json", PLUGIN_ROOT.parent / "local" / "config.json"]
 
 
+def ids(value) -> list:
+    if isinstance(value, list):
+        return [int(v) for v in value]
+    return [int(v) for v in str(value).replace(" ", "").split(",") if v]
+
+
 def load_config() -> dict:
+    """預設值 → 設定檔 → 插件設定（/plugin 介面填的 userConfig，以環境變數傳入）。"""
     cfg = dict(DEFAULTS)
     for p in config_paths():
         if p.exists():
             cfg.update(json.loads(p.read_text(encoding="utf-8")))
+    for key in ("bot_token", "allowed_chat_ids", "allowed_user_ids"):
+        val = os.environ.get("CLAUDE_PLUGIN_OPTION_" + key.upper())
+        if val:
+            cfg[key] = val
+    cfg["allowed_chat_ids"] = ids(cfg["allowed_chat_ids"])
+    cfg["allowed_user_ids"] = ids(cfg["allowed_user_ids"])
     return cfg
 
 
