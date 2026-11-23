@@ -35,6 +35,9 @@ STATE.setdefault("cards", {})
 SEP = "━━━━━━━━━━━━"
 VERSION = str(os.path.getmtime(__file__)) + "|" + os.path.abspath(__file__)  # 程式更新時 ensure_daemon 換掉舊的
 PHONE_PREFIX = "The user sent this message from their phone (Telegram); treat it as their prompt:\n"
+# Claude Code 自動送進來的輸入（背景任務／子代理回報、Stop hook 回饋、手機訊息本身等），不是我打的字
+AUTO_PREFIXES = ("<", "Another Claude session", "[Subagent", PHONE_PREFIX[:30])
+DONE_TASK = ("completed", "failed", "killed", "stopped", "done", "cancelled", "error")
 
 lock = threading.RLock()
 cond = threading.Condition(lock)  # 收件匣／狀態變化時喚醒 wait_phone 的長輪詢
@@ -154,8 +157,8 @@ class Session:
 
     @property
     def label(self) -> str:
-        return {"idle": "💤 閒置", "sent": "🕐 已送出", "busy": "🔄 執行中", "done": "✅ 完成",
-                "ended": "⚫ 已結束"}[self.status]
+        return {"idle": "💤 閒置", "sent": "🕐 已送出", "busy": "🔄 執行中", "bg": "⏳ 背景執行中",
+                "done": "✅ 完成", "ended": "⚫ 已結束"}[self.status]
 
     def start_turn(self, prompt: str):
         self.status, self.prompt, self.reply, self.note = "busy", prompt, "", ""
@@ -176,7 +179,7 @@ class Session:
             body.append("🕐 已送出，等待 Claude")
         elif self.started:
             elapsed = fmt_secs((self.finished or time.time()) - self.started)
-            body.append(f"{'🔄' if self.status == 'busy' else '⏱'} {elapsed} · 工具 {self.tools} 次")
+            body.append(f"{'🔄' if self.status in ('busy', 'bg') else '⏱'} {elapsed} · 工具 {self.tools} 次")
         marks = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
         body += [f"{marks.get(st, '•')} {clip(text, 120)}" for st, text in self.todos.values()]
         body += [f"⏳ 已排隊：{clip(t, 200)}" for t in self.inbox if self.status != "sent"]
@@ -304,9 +307,12 @@ def on_hook(ev: dict):
         s = session(sid, ev.get("cwd") or "")
         if name == "UserPromptSubmit":
             prompt = (ev.get("prompt") or "").strip()
-            if prompt and not prompt.startswith(("<", PHONE_PREFIX[:30])):  # 系統訊息、手機訊息回音不算
+            if prompt and not prompt.startswith(AUTO_PREFIXES):  # 只有我實際打的字才算新的一回合
                 s.start_turn(prompt)
                 refresh(s, now=True)
+            elif s.prompt and s.status != "sent":  # 自動接續（委派回報等）：沿用原本的輸入與計時
+                s.status, s.finished = "busy", 0.0
+                refresh(s)
         elif name == "PostToolUse" and s.status == "busy":
             s.tools += 1
             task_update(s, ev.get("tool_name") or "", ev.get("tool_input") or {}, ev.get("tool_response"))
@@ -320,9 +326,17 @@ def on_hook(ev: dict):
                 s.note = f"🔔 {clip(ev.get('message', ''), 200)}"
                 refresh(s)
         elif name == "Stop" and s.prompt:
-            s.status, s.finished = "done", time.time()
-            s.reply, s.note = (ev.get("last_assistant_message") or "").strip(), ""
-            refresh(s, notify=CFG["notify_on_done"] and not s.inbox, now=True)
+            s.reply = (ev.get("last_assistant_message") or "").strip() or s.reply
+            running = [t for t in ev.get("background_tasks") or []
+                       if str(t.get("status", "running")).lower() not in DONE_TASK]
+            log.info("stop %s background=%s", sid[:8],
+                     [(t.get("type"), t.get("status"), clip(t.get("description", ""), 30)) for t in running])
+            if running:  # 還有背景任務：回合其實沒結束，靜靜更新、不響（此時仍可接手機訊息）
+                s.status, s.note = "bg", f"⏳ 背景任務 {len(running)} 個執行中"
+                refresh(s, now=True)
+            else:        # 全部做完才算完成，重發卡片讓手機響一次
+                s.status, s.finished, s.note = "done", time.time(), ""
+                refresh(s, notify=CFG["notify_on_done"] and not s.inbox, now=True)
         elif name == "SessionEnd":
             s.status, s.finished = "ended", s.finished or time.time()
             if s.msg_id:
