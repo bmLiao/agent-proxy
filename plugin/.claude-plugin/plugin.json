@@ -2,5 +2,23 @@
   "name": "agent-proxy",
   "version": "0.2.0",
   "description": "用 Telegram 遠端監控、確認、輸入已開著的 Claude Code session",
-  "author": { "name": "BM.Liao" }
+  "author": { "name": "BM.Liao" },
+  "userConfig": {
+    "bot_token": {
+      "type": "string",
+      "title": "Telegram bot token",
+      "description": "向 @BotFather 申請的 bot token",
+      "sensitive": true
+    },
+    "allowed_chat_ids": {
+      "type": "string",
+      "title": "允許的 chat id",
+      "description": "逗號分隔；不知道就先留空，對 bot 傳 /id 查詢"
+    },
+    "allowed_user_ids": {
+      "type": "string",
+      "title": "允許的 user id",
+      "description": "逗號分隔；留空表示 chat 內所有人都能操作"
+    }
+  }
 }

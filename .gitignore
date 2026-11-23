@@ -1,7 +1,5 @@
-local/*
-!local/config.example.json
+local/
+__pycache__/
 *.log
 *.tmp
-__pycache__/
-.runtime/
 plugin/.data/

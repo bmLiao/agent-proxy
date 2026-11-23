@@ -1,6 +1,6 @@
 # PLAN：agent-proxy v2 — 插件 + asyncRewake
 
-> 狀態：規劃中（分支 `feat/channel-mcp`）。先做 Windows，驗證後移植 Mac（預期不改程式碼）。
+> 狀態：M1–M5 完成（分支 `feat/channel-mcp`）；M6（桌面 App、Mac）待實測。
 
 ## 1. 目標
 
@@ -15,9 +15,10 @@
 | 項目 | 結果 |
 |---|---|
 | `asyncRewake` hook 在 session **閒置時**叫醒 Claude 並執行手機指令（含工具呼叫） | ✅ 2026-11-23 PoC，連續兩輪成功 |
-| HTTP hooks（`type: http`）送達本機服務 | ✅ Channel 版實測 |
+| HTTP hooks（`type: http`）送達本機服務 | ✅ 實測 |
 | 桌面 App 觸發 hooks | ⏳ 文件有寫，未實測 |
-| 插件 `userConfig` 值可用於 HTTP hook header 的環境變數插值 | ⏳ 未驗證（不行則改 async command hook） |
+| 手機輸入、排隊、away 權限按鈕（真實互動 session） | ✅ 2026-11-23 實測 |
+| 插件 `userConfig` 以環境變數傳給 daemon | ⏳ 未實測（另可用 config.json） |
 
 ## 3. 架構
 

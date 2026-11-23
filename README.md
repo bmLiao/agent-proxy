@@ -1,81 +1,65 @@
-# agent-proxy：用 Telegram 遙控 Claude Code
+# agent-proxy：用 Telegram 遠端操作 Claude Code
 
-## 新版：Channel 模式（建議）
+Claude Code 插件。在手機上**監控、確認、輸入**電腦上已經開著的 Claude Code session：
+不需接管、不打字進終端機、不用特殊方式啟動，終端機、VSCode、桌面 App 都適用，Windows / Mac 同一套。
 
 ```
-手機 Telegram ⇄ channel.py（MCP Channel 伺服器，隨 CLI 啟動/結束）⇄ 這一個 claude session
+手機 Telegram ⇄ daemon（自動啟動）⇄ 插件 hooks ⇄ 你開著的 claude session
 ```
 
-不需要接管、不打字進終端機、不用常駐 relay，也不改任何全域設定：
+## 功能
 
-- 電腦照常使用；手機直接打字 = 對 Claude 說話（Claude 執行中會排到下一輪）
-- 權限確認：電腦視窗與手機按鈕**同時有效，先按先贏**；手機直接回文字 = 拒絕並改給指示
-- 電腦端輸入、📋 Todo、回合完成的回覆自動推到手機（`show_tool_calls: true` 可看每個工具呼叫）
+- **一個 session 一張卡片**：我的輸入 + 當前進度（耗時、工具次數、Todo），原地更新；
+  完成時卡片重發（手機會響），回覆太長可按「📄 看全文」
+- **手機輸入**：直接打字＝對 Claude 說話（閒置時立刻叫醒，執行中自動排隊）；你傳的訊息收到後會刪除，聊天室只留卡片
+- **權限確認**：`/away` 時推到手機（允許／拒絕／之後都允許，或直接回文字＝拒絕並改給指示，也能回答 Claude 的提問）；
+  `/back`（預設）時由電腦端確認
+- **指令**：`/status` 狀態、`/to` 選擇手機訊息送往哪個 session、`/away`、`/back`
 - 子代理內部事件不轉播
-
-使用：
-
-1. 照下方「安裝」第 1、2 步設定 `local/config.json`（bot_token、白名單）。
-2. 用 `python cctg.py` 取代 `claude` 啟動（其他參數照傳，例如 `python cctg.py --resume`）。
-   Git Bash 可加 alias：`alias cctg='python ~/agent-proxy/cctg.py'`。
-3. Channels 是研究預覽功能，自訂 channel 每次啟動 Claude Code 會請你確認一次。
-
-限制：
-- 需 Claude Code 2.1.234+、用 claude.ai 帳號或 Console API Key 登入；只支援互動模式（`-p` 不會收手機訊息）。
-- `/clear`、`/compact` 等斜線指令與 Esc 中斷無法從手機送出。
-- 同一個 bot 同時只能有一個 `cctg`（或舊版 relay.py）在收訊息。
-- log 在 `local/channel.log`。
-
----
-
-## 舊版：relay 接管模式（Windows 限定）
-
-```
-手機 Telegram ⇄ relay.py ⇄ 電腦上開著的互動式 CLI（cli_hook.py 登記 + 主控台打字）
-```
-
-relay 只接管已經開著的 CLI，**不會自己啟動 claude**；沒接管時手機訊息不會被執行。
-
-只用 Python 標準庫，不需要 `pip install`。目前僅支援 Windows（打字進 CLI 用的是 Windows 主控台 API）。
 
 ## 安裝
 
-1. `@BotFather` → `/newbot` 取得 token。
-2. `copy local\config.example.json local\config.json`，填 `bot_token`、`allowed_chat_ids`、`allowed_user_ids`。
-   不知道 id 就先啟動 relay，對 bot 傳 `/start`，它會告訴你。
-   - `local/`：私密與本機資料（`config.json` 機器人資訊、`state.json` 接管狀態），除了範本外都不進版控。
-   - 根目錄 `config.json`：一般設定（`flush_interval`、`show_tool_calls`、`cli_approval_timeout`），可提交；
-     兩者同名欄位以 `local/config.json` 為準。
-3. `python install_hook.py`：把 hook 加到 `%CLAUDE_CONFIG_DIR%\settings.json`（會備份 `.bak`）。
-   **已開著的 CLI 要重開**才會載入 hook。移除用 `python install_hook.py --uninstall`。
-4. `python relay.py`（長期使用可在工作排程器設定登入時執行 `pythonw relay.py`）。
+需要 Python 3.9+（只用標準庫）與 Claude Code。
 
-## 接管電腦上的 CLI
+1. `@BotFather` → `/newbot` 取得 bot token。
+2. 安裝插件：
+   ```
+   claude plugin marketplace add <這個 repo 的路徑或 GitHub owner/repo>
+   claude plugin install agent-proxy@agent-proxy
+   ```
+3. 在 Claude Code 執行 `/plugin configure agent-proxy@agent-proxy`，填 bot token、允許的 chat id / user id。
+   不知道 id：先只填 token，開一個新 session，對 bot 傳 `/id`。
+4. **之後開的 session** 都會自動連上（裝插件前就開著的要重開）。
 
-1. 手機 `/cli` → 列出所有已登記的 CLI（💤 閒置、🔄 執行中、🔐 等待確認），點一個接管。
-2. 接管後：
-   - 電腦端輸入（👤）、工具呼叫、📋 Todo 進度、回合完成的回覆，都會即時傳到手機
-   - 手機**直接打字 = 打進那個 CLI**，執行中送出的文字會排進 CLI 的佇列
-   - `/clear`、`/compact`、`/model` 等不是 relay 的指令，會**原樣轉送給 CLI**
-   - `/esc`：送 Esc 中斷 CLI
-   - 權限請求推到手機（允許、拒絕、之後都允許，或直接打字＝拒絕並給新指示）；`cli_approval_timeout` 秒沒回應就退回電腦端確認
-3. `/bg` 放開 CLI，或 `/cli` 換一個接管。
+也可以不用插件設定，改放 `<Claude 設定目錄>/plugins/data/agent-proxy-agent-proxy/config.json`：
 
-沒被接管的 CLI 完全不受影響，hook 只做登記，馬上放行。
+```json
+{ "bot_token": "123:ABC", "allowed_chat_ids": [123456789], "allowed_user_ids": [123456789] }
+```
 
-限制：
-- 打字功能需要 CLI 跑在終端機裡（Windows Terminal、VSCode 內建終端機、cmd 都可以）。VSCode 的 Claude **擴充面板**沒有主控台，只能監控與授權。
-- 如果 CLI 正在電腦上跳確認視窗，relay 會拒絕送出文字，避免打進視窗裡。
+其他可調：`edit_interval`（卡片更新最小間隔，預設 3 秒）、`notify_on_done`（完成時重發卡片讓手機響，預設 true）、
+`away_timeout`（away 時手機多久沒回應退回電腦，預設 600 秒）、`port`（預設 47821）。
+
+開發時可直接載入：`claude --plugin-dir ./plugin`（設定讀 repo 的 `local/config.json`）。
+
+## 限制
+
+- 手機無法送 `/clear`、`/compact` 等斜線指令，也無法 Esc 中斷
+- 權限確認是二選一：away 時由手機決定，back 時由電腦決定
+- 手機訊息以系統提醒的形式交給 Claude（asyncRewake），不是一般的使用者輸入
+- 同一個 bot 同時只能有一個程式在收訊息
 
 ## 檔案
 
 | 檔案 | 用途 |
 |---|---|
-| `relay.py` | 主程式：Telegram 長輪詢、CLI 登記/接管、本機 HTTP 端點 |
-| `cli_hook.py` | Claude Code hook：回報事件、找出 CLI 的 pid、轉送權限請求 |
-| `console_inject.py` | 把文字或按鍵寫進指定 CLI 的主控台 |
-| `install_hook.py` | 安裝/移除 hook（`--print` 只輸出 JSON，可給 `claude --settings`） |
-| `tgapi.py` | Telegram API、設定讀取 |
+| `plugin/hooks/hooks.json` | 掛上的 hooks：事件用 HTTP 送 daemon，SessionStart 拉起 daemon，asyncRewake 等手機訊息 |
+| `plugin/daemon/daemon.py` | Telegram 長輪詢、卡片、權限、手機訊息派送 |
+| `plugin/daemon/tgapi.py` | Telegram API 與設定讀取 |
+| `plugin/scripts/ensure_daemon.py` | SessionStart：daemon 沒在跑（或版本不符）就啟動 |
+| `plugin/scripts/wait_phone.py` | asyncRewake：等手機訊息，收到就叫醒 Claude |
 
-安全性：本機端點只聽 `127.0.0.1`，token 每次啟動隨機產生（寫在 `.runtime/relay.json`）；
-Telegram 端只接受白名單內的 chat 與使用者。能控制 bot 就等於能在你電腦上執行指令，請保管好 token。
+log 與狀態在插件資料夾（`daemon.log`、`state.json`）。
+
+安全性：daemon 只聽 `127.0.0.1`；Telegram 只接受白名單內的 chat 與使用者。
+能操作這個 bot 就等於能在你的電腦上執行指令，請保管好 token。

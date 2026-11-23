@@ -43,7 +43,8 @@ def load_config() -> dict:
         if p.exists():
             cfg.update(json.loads(p.read_text(encoding="utf-8")))
     for key in ("bot_token", "allowed_chat_ids", "allowed_user_ids"):
-        val = os.environ.get("CLAUDE_PLUGIN_OPTION_" + key.upper())
+        val = (os.environ.get("CLAUDE_PLUGIN_OPTION_" + key.upper())
+               or os.environ.get("CLAUDE_PLUGIN_OPTION_" + key))
         if val:
             cfg[key] = val
     cfg["allowed_chat_ids"] = ids(cfg["allowed_chat_ids"])

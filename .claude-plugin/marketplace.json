@@ -1,0 +1,14 @@
+{
+  "name": "agent-proxy",
+  "description": "agent-proxy：Telegram 遠端操作 Claude Code",
+  "owner": {
+    "name": "BM.Liao"
+  },
+  "plugins": [
+    {
+      "name": "agent-proxy",
+      "source": "./plugin",
+      "description": "用 Telegram 遠端監控、確認、輸入已開著的 Claude Code session"
+    }
+  ]
+}
