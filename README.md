@@ -42,7 +42,8 @@ Claude Code 插件。在手機上**監控、確認、輸入**電腦上已經開�
 ```
 
 其他可調：`edit_interval`（卡片更新最小間隔，預設 3 秒）、`notify_on_done`（完成時重發卡片讓手機響，預設 true）、
-`away_timeout`（away 時手機多久沒回應退回電腦，預設 600 秒）、`port`（預設 47821）。
+`away_timeout`（away 時手機多久沒回應退回電腦，預設 600 秒）。
+daemon 固定使用本機 port 47821（寫在 `hooks.json`）。
 
 開發時可直接載入：`claude --plugin-dir ./plugin`（設定讀 repo 的 `local/config.json`）。
 

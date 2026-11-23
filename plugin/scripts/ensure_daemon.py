@@ -10,12 +10,11 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "daemon"))
-from tgapi import DATA_DIR, load_config, unattended  # noqa: E402
+from tgapi import DATA_DIR, code_version, load_config, unattended  # noqa: E402
 
 BASE = f"http://127.0.0.1:{load_config()['port']}"
 URL = BASE + "/hook"
-DAEMON = ROOT / "daemon" / "daemon.py"
-VERSION = str(os.path.getmtime(DAEMON)) + "|" + os.path.abspath(DAEMON)
+VERSION = code_version()
 
 
 def get(path: str):

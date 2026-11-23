@@ -4,6 +4,7 @@
 被新的 waiter 取代、session 結束、或超過 12 小時 → exit 0。daemon 暫時連不上就重試。
 """
 import json
+import os
 import pathlib
 import secrets
 import sys
@@ -13,7 +14,7 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "daemon"))
-from tgapi import load_config, unattended  # noqa: E402
+from tgapi import load_config, pid_alive, unattended  # noqa: E402
 
 
 def main():
@@ -24,7 +25,10 @@ def main():
                                     "wid": secrets.token_hex(6)})
     url = f"http://127.0.0.1:{load_config()['port']}/wait?{query}"
     end = time.time() + 12 * 3600
+    claude_pid = int(os.environ.get("CLAUDE_PID") or 0)
     while time.time() < end:
+        if claude_pid and not pid_alive(claude_pid):  # CLI 已關閉
+            return 0
         try:
             with urllib.request.urlopen(url, timeout=70) as r:
                 res = json.loads(r.read())

@@ -17,12 +17,40 @@ DEFAULTS = {
     "bot_token": "",
     "allowed_chat_ids": [],
     "allowed_user_ids": [],   # 非空時只有這些使用者能操作
-    "port": 47821,
+    "port": 47821,            # 固定：hooks.json 的 URL 也寫死這個 port
     "edit_interval": 3,       # 卡片 edit 最小間隔秒數
     "notify_on_done": True,   # 完成時刪卡重發（手機會響）；False 只 edit
     "idle_exit": 1800,        # 沒有 session 也沒有任何 hook 事件幾秒後自動結束
     "away_timeout": 600,      # away 時手機幾秒沒回應就退回電腦確認
 }
+
+
+def code_version() -> str:
+    """daemon 程式內容的雜湊：程式更新才換 daemon；不同設定目錄的同版安裝視為同一版。"""
+    import hashlib
+    h = hashlib.sha1()
+    for name in ("daemon.py", "tgapi.py"):
+        h.update((PLUGIN_ROOT / "daemon" / name).read_bytes())
+    return h.hexdigest()[:12]
+
+
+def pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        alive = k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT = 還在跑
+        k32.CloseHandle(h)
+        return alive
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def unattended() -> bool:

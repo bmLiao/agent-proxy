@@ -18,7 +18,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from tgapi import DATA_DIR, MAX_LEN, TG, load_config, load_json, save_json  # noqa: E402
+from tgapi import DATA_DIR, MAX_LEN, TG, code_version, load_config, load_json, save_json  # noqa: E402
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(filename=str(DATA_DIR / "daemon.log"), encoding="utf-8",
@@ -33,7 +33,7 @@ STATE = load_json(STATE_FILE, {})
 STATE.setdefault("away", False)
 STATE.pop("cards", None)
 SEP = "━━━━━━━━━━━━"
-VERSION = str(os.path.getmtime(__file__)) + "|" + os.path.abspath(__file__)  # 程式更新時 ensure_daemon 換掉舊的
+VERSION = code_version()  # 程式內容變了 ensure_daemon 才換掉舊的
 PHONE_PREFIX = "The user sent this message from their phone (Telegram); treat it as their prompt:\n"
 # Claude Code 自動送進來的輸入（背景任務／子代理回報、Stop hook 回饋、手機訊息本身等），不是我打的字
 AUTO_PREFIXES = ("<", "Another Claude session", "[Subagent", PHONE_PREFIX[:30])
@@ -162,6 +162,8 @@ class Session:
         self.poll_end = time.time()
         self.pendings: list = []    # 待確認排隊（平行子代理可能同時要確認），卡片一次顯示第一筆
         self.last_seen = time.time()
+        self.last_event = time.time()  # 最後一個 hook 事件（判斷忙碌用；waiter 輪詢不算）
+        self.created = time.time()
         self.truncated = False
         self.transcript = ""        # transcript 路徑，讀 Claude Code 產生的 ai-title
         self.custom_title = ""      # /rename 自訂的標題（hook 的 session_title）
@@ -181,7 +183,7 @@ class Session:
 
     @property
     def busy(self) -> bool:  # 太久沒有事件（例如 Esc 中斷沒有 Stop）就不再視為忙碌
-        return self.status == "busy" and time.time() - self.last_seen < 600
+        return self.status == "busy" and time.time() - self.last_event < 600
 
     @property
     def pending(self):
@@ -190,7 +192,7 @@ class Session:
     @property
     def label(self) -> str:
         return {"idle": "💤 閒置", "sent": "🕐 已送出", "busy": "🔄 執行中", "bg": "⏳ 背景執行中",
-                "done": "✅ 完成", "ended": "⚫ 已結束"}[self.status]
+                "done": "✅ 完成", "stopped": "⏹ 已停止", "ended": "⚫ 已結束"}[self.status]
 
     def start_turn(self, prompt: str):
         self.status, self.prompt, self.reply, self.note = "busy", prompt, "", ""
@@ -265,48 +267,48 @@ def lock_if_free(s: Session):
 
 
 CARD = {"dirty": False, "last_edit": 0.0}  # 整個聊天室只有一張卡，message_id 存在 STATE["card"]
-
-
-def send_card(s: Session, notify: bool):
-    """發新卡；有舊卡先刪除（刪除失敗不影響，例如已超過 48 小時）。"""
-    if CHAT is None:
-        return
-    text, markup = s.render(), s.markup()
-    if STATE.get("card"):
-        tg.call("deleteMessage", chat_id=CHAT, message_id=STATE["card"])
-    res = tg.call("sendMessage", chat_id=CHAT, text=text, disable_notification=not notify,
-                  reply_markup=markup, link_preview_options={"is_disabled": True})
-    STATE["card"] = (res.get("result") or {}).get("message_id")
-    CARD["dirty"], CARD["last_edit"] = False, time.time()
-    save_state()
-
-
-def edit_card(s: Session):
-    if CHAT is None:
-        return
-    if not STATE.get("card"):
-        return send_card(s, notify=False)
-    res = tg.call("editMessageText", chat_id=CHAT, message_id=STATE["card"], text=s.render(),
-                  reply_markup=s.markup(), link_preview_options={"is_disabled": True})
-    CARD["dirty"], CARD["last_edit"] = False, time.time()
-    if not res.get("ok") and "not modified" not in str(res.get("description")):
-        STATE["card"] = None  # 卡片被刪掉等 → 換一張新的
-        send_card(s, notify=False)
+CARD_Q: "queue.Queue" = queue.Queue()  # (notify, text, markup)：在鎖內算好內容，網路呼叫交給 card_worker
 
 
 def refresh(s: Session, now: bool = False, notify: bool = False):
-    if s is not locked():  # 沒鎖定的 session 不上卡片
+    if s is not locked() or CHAT is None:  # 沒鎖定的 session 不上卡片
         return
-    if notify:
-        send_card(s, notify=True)
-    elif now:
-        edit_card(s)
+    if notify or now:
+        CARD_Q.put((notify, s.render(), s.markup()))
     else:
         CARD["dirty"] = True  # 交給 ticker 依 edit_interval 節流
 
 
 def refresh_all():
     CARD["dirty"] = True
+
+
+def card_worker():
+    """依序送出卡片更新；同時排隊的只送最新內容，其中任何一筆要響就重發卡片。"""
+    while True:
+        jobs = [CARD_Q.get()]
+        while not CARD_Q.empty():
+            jobs.append(CARD_Q.get_nowait())
+        notify = any(j[0] for j in jobs)
+        _, text, markup = jobs[-1]
+        CARD["dirty"], CARD["last_edit"] = False, time.time()
+        safe(push_card, text, markup, notify)
+
+
+def push_card(text: str, markup: dict, notify: bool):
+    card = STATE.get("card")
+    if card and not notify:
+        res = tg.call("editMessageText", chat_id=CHAT, message_id=card, text=text,
+                      reply_markup=markup, link_preview_options={"is_disabled": True})
+        if res.get("ok") or "not modified" in str(res.get("description")):
+            return
+    if card:  # 重發：先刪舊卡（刪除失敗不影響，例如已超過 48 小時）
+        tg.call("deleteMessage", chat_id=CHAT, message_id=card)
+    res = tg.call("sendMessage", chat_id=CHAT, text=text, disable_notification=not notify,
+                  reply_markup=markup, link_preview_options={"is_disabled": True})
+    with lock:
+        STATE["card"] = (res.get("result") or {}).get("message_id")
+        save_state()
 
 
 def ticker():
@@ -321,7 +323,8 @@ def ticker():
                 s.update_title()
                 CARD["dirty"] |= s.title != old
             if s and CARD["dirty"] and time.time() - CARD["last_edit"] >= CFG["edit_interval"]:
-                safe(edit_card, s)
+                CARD["dirty"] = False
+                refresh(s, now=True)
 
 
 # ---------------------------------------------------------------- hooks
@@ -347,12 +350,18 @@ def on_hook(ev: dict):
     name, sid = ev.get("hook_event_name", ""), ev.get("session_id") or "?"
     log.info("hook %s%s %s %s", sid[:8], f" agent={ev['agent_id'][:8]}" if ev.get("agent_id") else "", name,
              ev.get("tool_name") or repr((ev.get("prompt") or "")[:80]) if name == "UserPromptSubmit" or ev.get("tool_name") else "")
+    with cond:
+        if name == "PostToolUse" and sid in SESSIONS:  # 工具已執行 = 對應的確認在電腦端處理掉了
+            clear_answered(SESSIONS[sid], ev)
     if ev.get("agent_id"):  # 子代理內部事件不轉播
         return
     with cond:
         if sid not in SESSIONS and name != "SessionStart":  # 只追蹤註冊過的（互動）session
             return
+        if sid in ENDED:
+            return
         s = session(sid, ev.get("cwd") or "")
+        s.last_event = time.time()
         s.transcript = ev.get("transcript_path") or s.transcript
         s.custom_title = ev.get("session_title") or s.custom_title
         if name in ("SessionStart", "UserPromptSubmit", "Stop"):  # 標題會隨對話更新
@@ -376,11 +385,14 @@ def on_hook(ev: dict):
             refresh(s)
         elif name == "Notification":
             if ev.get("notification_type") == "idle_prompt" and s.status == "busy":
-                s.status = "done"
+                s.status, s.finished = "stopped", time.time()  # 沒有 Stop 就閒置：多半是 Esc 中斷
+                refresh(s, now=True)
             elif ev.get("notification_type") not in ("idle_prompt", "permission_prompt") and s.prompt:
                 s.note = f"🔔 {clip(ev.get('message', ''), 200)}"
                 refresh(s)
         elif name == "Stop" and s.prompt:
+            for pend in [x for x in s.pendings if not x.agent]:  # 主代理已停：它的確認不會再有結果
+                pend.resolve({"fallback": "✅ 已在電腦端處理"})
             s.reply = (ev.get("last_assistant_message") or "").strip() or s.reply
             running = [t for t in ev.get("background_tasks") or []
                        if str(t.get("status", "running")).lower() not in DONE_TASK]
@@ -395,6 +407,14 @@ def on_hook(ev: dict):
         elif name == "SessionEnd":
             drop_session(s)
         cond.notify_all()
+
+
+def clear_answered(s: Session, ev: dict):
+    """away 時如果電腦端也出現確認並被按掉，工具就會執行；把手機上同一筆收掉。"""
+    for pend in s.pendings:
+        if pend.tool == ev.get("tool_name") and pend.inp == (ev.get("tool_input") or {}) \
+                and pend.agent == ev.get("agent_id"):
+            pend.resolve({"fallback": "✅ 已在電腦端處理"})
 
 
 def on_permission(ev: dict) -> dict:
@@ -439,10 +459,15 @@ def on_permission(ev: dict) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}
 
 
+ENDED: set = set()  # 已結束的 session，殘留的 waiter 不能把它復活
+
+
 def wait_phone(sid: str, wid: str, cwd: str, timeout: float = 50) -> dict:
     """wait_phone 的長輪詢：有手機訊息且 session 不忙時交給它；新的 waiter 會取代舊的。"""
     end = time.time() + timeout
     with cond:
+        if sid in ENDED:
+            return {"exit": True}
         s = session(sid, cwd)
         if s.waiter != wid:
             s.waiter = wid
@@ -463,7 +488,7 @@ def _wait_loop(s: Session, sid: str, wid: str, end: float) -> dict:
             if s.inbox and not s.busy and not s.pending and s is locked():
                 text = s.inbox.pop(0)
                 s.start_turn(text)
-                threading.Thread(target=safe, args=(edit_card, s), daemon=True).start()
+                refresh(s, now=True)
                 log.info("送出手機訊息 %s", sid[:8])
                 return {"text": PHONE_PREFIX + text}
             left = end - time.time()
@@ -474,16 +499,25 @@ def _wait_loop(s: Session, sid: str, wid: str, end: float) -> dict:
 
 
 def drop_session(s: Session):
-    """session 結束：鎖定中的話卡片標示已結束並釋放鎖定（下一個有動靜的 session 接手）。"""
-    if s is locked():
-        s.status, s.finished = "ended", s.finished or time.time()
-        s.note = "下一個開始活動的 session 會自動接手，或用 /to 選擇"
-        refresh(s, now=True)
-        STATE.pop("target", None)
-        save_state()
+    """session 結束：鎖定中的話釋放鎖定；剛開的 session（例如 /clear 換的新 session）直接接手，
+    否則卡片標示已結束，等下一個開始活動的 session 接手。"""
+    was_locked = s is locked()
+    ENDED.add(s.sid)
     SESSIONS.pop(s.sid, None)
     for pend in s.pendings:
         pend.resolve({"fallback": "⚫ session 已結束"})
+    if not was_locked:
+        return
+    STATE.pop("target", None)
+    fresh = [x for x in SESSIONS.values() if time.time() - x.created < 15]
+    if fresh:
+        lock_if_free(max(fresh, key=lambda x: x.created))
+        refresh(locked(), now=True)
+    else:
+        s.status, s.finished = "ended", s.finished or time.time()
+        s.note = "下一個開始活動的 session 會自動接手，或用 /to 選擇"
+        CARD_Q.put((False, s.render(), s.markup()))
+    save_state()
 
 
 HOOK_QUEUE: "queue.Queue[dict]" = queue.Queue()
@@ -574,7 +608,7 @@ def on_callback(cq: dict):
     if not authorized(chat_id, cq["from"]["id"]):
         return tg.call("answerCallbackQuery", callback_query_id=cq["id"], text="你沒有操作權限")
     kind, _, val = cq.get("data", "").partition(":")
-    msg = ""
+    msg = full = ""
     with cond:
         if kind in ("perm", "ans"):
             rid, _, choice = val.partition(":")
@@ -594,13 +628,13 @@ def on_callback(cq: dict):
                 p.resolve(res)
         elif kind == "full":
             s = SESSIONS.get(val)
-            if s and s.reply:
-                send_long(chat_id, f"📄 {s.title} 完整回覆\n\n{s.reply}")
-            else:
-                msg = "內容已不存在"
+            full = f"📄 {s.title} 完整回覆\n\n{s.reply}" if s and s.reply else ""
+            msg = "" if full else "內容已不存在"
         elif kind == "to":
             msg = switch_lock(val)
     tg.call("answerCallbackQuery", callback_query_id=cq["id"], **({"text": msg} if msg else {}))
+    if full:
+        send_long(chat_id, full)
 
 
 def switch_lock(sid: str) -> str:
@@ -643,47 +677,52 @@ def set_away(on: bool, src: str):
 
 def on_command(chat_id, text: str):
     cmd = text.split()[0].split("@")[0].lower()
-    with cond:
+    reply, ttl, buttons = "⚠️ 斜線指令（/clear、/compact…）無法從手機送出，請在電腦端執行", 15, None
+    with cond:  # 鎖內只算內容，送訊息在鎖外
         if cmd in ("/away", "/back"):
             set_away(cmd == "/away", "manual")
-            return notice(chat_id, "🚶 away：權限確認改到手機" if STATE["away"]
-                          else "🪑 back：權限確認在電腦端")
-        if cmd == "/to":
-            rows = [[(("🔒 " if s is locked() else "") + f"{s.title} · {s.label}", f"to:{s.sid}")]
-                    for s in SESSIONS.values()]
-            return notice(chat_id, "選擇要鎖定的 session（一次只鎖定一個）：" if rows else "沒有開著的 session",
-                          ttl=60, buttons=rows)
-        if cmd in ("/status", "/start", "/id"):
+            reply = "🚶 away：權限確認改到手機" if STATE["away"] else "🪑 back：權限確認在電腦端"
+        elif cmd == "/to":
+            buttons = [[(("🔒 " if s is locked() else "") + f"{s.title} · {s.label}", f"to:{s.sid}")]
+                       for s in SESSIONS.values()]
+            reply = "選擇要鎖定的 session（一次只鎖定一個）：" if buttons else "沒有開著的 session"
+            ttl = 60
+        elif cmd in ("/status", "/start", "/id"):
             t = locked()
             rows = [f"{'🔒' if s is t else '•'} {s.title}（{s.project}）· {s.label}" for s in SESSIONS.values()]
-            return notice(chat_id, f"{mode_label()}\n"
-                          + ("\n".join(rows) or "沒有開著的 session"), ttl=30)
-    notice(chat_id, "⚠️ 斜線指令（/clear、/compact…）無法從手機送出，請在電腦端執行")
+            reply, ttl = f"{mode_label()}\n" + ("\n".join(rows) or "沒有開著的 session"), 30
+    notice(chat_id, reply, ttl=ttl, buttons=buttons)
 
 
 def on_text(chat_id, text: str):
     with cond:
         s = locked()
-        if not s:
-            return notice(chat_id, "沒有鎖定的 session（插件安裝後開的 session 才會出現，或用 /to 選擇）")
-        set_away(True, "auto")  # 從手機輸入 = 人不在電腦前
-        p = s.pending
-        if p and p.questions:
-            p.answer(text)
-            if not p.event.is_set():
-                refresh(s, now=True)
-        elif p:
-            p.resolve({"behavior": "deny", "said": True,
-                       "message": f"The user denied this action and said: {text}"})
-        else:
-            s.inbox.append(text)
-            if not s.busy:
-                s.status, s.prompt, s.note = "sent", text, ""
-                s.started, s.todos = 0.0, {}
-            if not s.waiter:
-                s.note = "⚠️ 這個 session 沒有在等手機訊息（插件安裝前就開著？）"
+        if s:
+            set_away(True, "auto")  # 從手機輸入 = 人不在電腦前
+            _deliver(s, text)
+    if not s:
+        notice(chat_id, "沒有鎖定的 session（插件安裝後開的 session 才會出現，或用 /to 選擇）")
+
+
+def _deliver(s: Session, text: str):
+    """手機文字：回答提問／拒絕並改給指示／排進收件匣等 waiter 送出（呼叫端持有鎖）。"""
+    p = s.pending
+    if p and p.questions:
+        p.answer(text)
+        if not p.event.is_set():
             refresh(s, now=True)
-            cond.notify_all()
+    elif p:
+        p.resolve({"behavior": "deny", "said": True,
+                   "message": f"The user denied this action and said: {text}"})
+    else:
+        s.inbox.append(text)
+        if not s.busy:
+            s.status, s.prompt, s.note = "sent", text, ""
+            s.started, s.todos = 0.0, {}
+        if not s.waiter:
+            s.note = "⚠️ 這個 session 沒有在等手機訊息（插件安裝前就開著？）"
+        refresh(s, now=True)
+        cond.notify_all()
 
 
 def on_update(u: dict):
@@ -708,8 +747,14 @@ def on_update(u: dict):
 
 
 def poll_loop():
-    res = tg.call("getUpdates", offset=-1, timeout=0)  # 略過啟動前累積的舊訊息
-    offset = ((res.get("result") or [{}])[-1].get("update_id", -1) + 1) if res.get("ok") else None
+    offset = None
+    res = tg.call("getUpdates", timeout=0)  # 啟動前累積的：2 分鐘內的照樣處理（daemon 重啟期間傳的），更舊的略過
+    for u in res.get("result") or []:
+        offset = u["update_id"] + 1
+        sent = ((u.get("message") or {}).get("date")
+                or ((u.get("callback_query") or {}).get("message") or {}).get("date") or 0)
+        if "callback_query" not in u and time.time() - sent < 120:
+            safe(on_update, u)
     while True:
         res = tg.call("getUpdates", _timeout=60, _retry=0, offset=offset, timeout=50,
                       allowed_updates=["message", "callback_query"])
@@ -758,7 +803,7 @@ def main():
             {"command": c, "description": d} for c, d in (
                 ("status", "目前狀態"), ("to", "切換鎖定的 session"),
                 ("away", "離開：權限確認改到手機"), ("back", "回來：權限確認在電腦端"))])
-    for fn in (ticker, hook_worker, reaper):
+    for fn in (ticker, hook_worker, reaper, card_worker):
         threading.Thread(target=fn, daemon=True).start()
     log.info("daemon 啟動 pid=%s port=%s", os.getpid(), CFG["port"])
     server.serve_forever()
