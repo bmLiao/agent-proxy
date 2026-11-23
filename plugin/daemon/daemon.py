@@ -384,7 +384,8 @@ def on_hook(ev: dict):
         if name == "UserPromptSubmit":
             prompt = (ev.get("prompt") or "").strip()
             if prompt and not prompt.startswith(AUTO_PREFIXES):  # 只有我實際打的字才算新的一回合
-                set_away(False, "auto")  # 在電腦端輸入 = 人在電腦前
+                if s is locked():  # 只看鎖定的 session：在其他窗口輸入不影響 away
+                    set_away(False, "auto")  # 在電腦端輸入 = 人在電腦前
                 s.start_turn(prompt)
                 refresh(s, now=True)
             elif s.prompt and s.status != "sent":  # 自動接續（委派回報等）：沿用原本的輸入與計時
