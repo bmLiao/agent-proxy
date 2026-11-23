@@ -83,6 +83,26 @@ def describe_tool(name: str, inp: dict) -> str:
     return f"🔧 {name}: {clip(json.dumps(inp, ensure_ascii=False), 600)}"
 
 
+def read_ai_title(path: str) -> str:
+    """從 transcript 尾端往前找最新的 ai-title（Claude Code 視窗上顯示的標題）。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            for tail in (256 * 1024, 4 * 1024 * 1024, size):  # 先讀尾端，找不到再擴大
+                f.seek(max(0, size - tail))
+                for line in reversed(f.read().split(b"\n")):
+                    if b'"ai-title"' in line:
+                        try:
+                            return json.loads(line).get("aiTitle", "")
+                        except Exception:
+                            continue
+                if tail >= size:
+                    break
+    except Exception:
+        pass
+    return ""
+
+
 # ---------------------------------------------------------------- 權限 / 提問
 class Pending:
     def __init__(self, sid, tool, inp, suggestions, agent=None):
@@ -143,10 +163,21 @@ class Session:
         self.pendings: list = []    # 待確認排隊（平行子代理可能同時要確認），卡片一次顯示第一筆
         self.last_seen = time.time()
         self.truncated = False
+        self.transcript = ""        # transcript 路徑，讀 Claude Code 產生的 ai-title
+        self.custom_title = ""      # /rename 自訂的標題（hook 的 session_title）
+        self.ai_title = ""
 
     @property
     def project(self) -> str:
         return os.path.basename(self.cwd.rstrip("\\/")) or self.cwd or "?"
+
+    @property
+    def title(self) -> str:
+        """給人看的名稱：視窗標題（自訂 → AI 產生），沒有才用專案資料夾名。"""
+        return clip(self.custom_title or self.ai_title or self.project, 50)
+
+    def update_title(self):
+        self.ai_title = read_ai_title(self.transcript) or self.ai_title
 
     @property
     def busy(self) -> bool:  # 太久沒有事件（例如 Esc 中斷沒有 Stop）就不再視為忙碌
@@ -169,7 +200,7 @@ class Session:
         icon = self.label
         if self.pending:
             icon = "🔐 待確認"
-        lines = [f"🔒 {self.project} · {icon}" + (" · away" if STATE["away"] else "")]
+        lines = [f"🔒 {self.title} · {icon}" + (" · away" if STATE["away"] else "")]
         others = len(SESSIONS) - 1
         if others > 0:
             lines.append(f"（另有 {others} 個 session，/to 可切換）")
@@ -279,10 +310,16 @@ def refresh_all():
 
 
 def ticker():
+    n = 0
     while True:
         time.sleep(1)
+        n += 1
         with lock:
             s = locked()
+            if s and n % 15 == 0:  # 視窗標題可能稍後才產生或被 /rename，定期重讀
+                old = s.title
+                s.update_title()
+                CARD["dirty"] |= s.title != old
             if s and CARD["dirty"] and time.time() - CARD["last_edit"] >= CFG["edit_interval"]:
                 safe(edit_card, s)
 
@@ -316,6 +353,10 @@ def on_hook(ev: dict):
         if sid not in SESSIONS and name != "SessionStart":  # 只追蹤註冊過的（互動）session
             return
         s = session(sid, ev.get("cwd") or "")
+        s.transcript = ev.get("transcript_path") or s.transcript
+        s.custom_title = ev.get("session_title") or s.custom_title
+        if name in ("SessionStart", "UserPromptSubmit", "Stop"):  # 標題會隨對話更新
+            s.update_title()
         if name in ("SessionStart", "UserPromptSubmit"):
             lock_if_free(s)
         if name == "UserPromptSubmit":
@@ -342,7 +383,7 @@ def on_hook(ev: dict):
             s.reply = (ev.get("last_assistant_message") or "").strip() or s.reply
             running = [t for t in ev.get("background_tasks") or []
                        if str(t.get("status", "running")).lower() not in DONE_TASK]
-            log.info("stop %s background=%s", sid[:8],
+            log.info("stop %s title=%r background=%s", sid[:8], s.title,
                      [(t.get("type"), t.get("status"), clip(t.get("description", ""), 30)) for t in running])
             if running:  # 還有背景任務：回合其實沒結束，靜靜更新、不響（此時仍可接手機訊息）
                 s.status, s.note = "bg", f"⏳ 背景任務 {len(running)} 個執行中"
@@ -553,7 +594,7 @@ def on_callback(cq: dict):
         elif kind == "full":
             s = SESSIONS.get(val)
             if s and s.reply:
-                send_long(chat_id, f"📄 {s.project} 完整回覆\n\n{s.reply}")
+                send_long(chat_id, f"📄 {s.title} 完整回覆\n\n{s.reply}")
             else:
                 msg = "內容已不存在"
         elif kind == "to":
@@ -567,7 +608,7 @@ def switch_lock(sid: str) -> str:
     if not new:
         return "這個 session 已結束"
     if new is old:
-        return f"🔒 已經鎖定 {new.project}"
+        return f"🔒 已經鎖定 {new.title}"
     if old:
         for pend in old.pendings:
             pend.resolve({"fallback": True})
@@ -576,7 +617,7 @@ def switch_lock(sid: str) -> str:
     save_state()
     log.info("切換鎖定 → %s %s", sid[:8], new.project)
     refresh(new, now=True)
-    return f"🔒 已鎖定 {new.project}"
+    return f"🔒 已鎖定 {new.title}"
 
 
 def on_command(chat_id, text: str):
@@ -589,13 +630,13 @@ def on_command(chat_id, text: str):
             return notice(chat_id, "🚶 away：權限確認改到手機" if STATE["away"]
                           else "🪑 back：權限確認在電腦端")
         if cmd == "/to":
-            rows = [[(("🔒 " if s is locked() else "") + f"{s.project} · {s.label}", f"to:{s.sid}")]
+            rows = [[(("🔒 " if s is locked() else "") + f"{s.title} · {s.label}", f"to:{s.sid}")]
                     for s in SESSIONS.values()]
             return notice(chat_id, "選擇要鎖定的 session（一次只鎖定一個）：" if rows else "沒有開著的 session",
                           ttl=60, buttons=rows)
         if cmd in ("/status", "/start", "/id"):
             t = locked()
-            rows = [f"{'🔒' if s is t else '•'} {s.project} · {s.label}" for s in SESSIONS.values()]
+            rows = [f"{'🔒' if s is t else '•'} {s.title}（{s.project}）· {s.label}" for s in SESSIONS.values()]
             return notice(chat_id, f"{'🚶 away' if STATE['away'] else '🪑 back'}\n"
                           + ("\n".join(rows) or "沒有開著的 session"), ttl=30)
     notice(chat_id, "⚠️ 斜線指令（/clear、/compact…）無法從手機送出，請在電腦端執行")
@@ -664,13 +705,13 @@ def poll_loop():
 
 # ---------------------------------------------------------------- 生命週期
 def reaper():
-    """清掉殘留 session（waiter 停止輪詢超過 2 分鐘，或 6 小時沒動靜）；沒有 session 超過 idle_exit 秒就結束。"""
+    """清掉殘留 session（waiter 停止輪詢超過 30 秒，或 6 小時沒動靜）；沒有 session 超過 idle_exit 秒就結束。"""
     empty_since = time.time()
     while True:
         time.sleep(30)
         with cond:
             for sid, s in list(SESSIONS.items()):
-                gone = s.waiter and not s.polls and time.time() - s.poll_end > 120
+                gone = s.waiter and not s.polls and time.time() - s.poll_end > 30
                 if gone or time.time() - s.last_seen > 6 * 3600:
                     log.info("移除殘留 session %s", sid[:8])
                     safe(drop_session, s)
