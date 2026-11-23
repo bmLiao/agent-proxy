@@ -4,3 +4,4 @@ local/*
 *.tmp
 __pycache__/
 .runtime/
+plugin/.data/
