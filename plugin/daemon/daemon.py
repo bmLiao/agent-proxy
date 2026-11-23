@@ -200,7 +200,7 @@ class Session:
         icon = self.label
         if self.pending:
             icon = "🔐 待確認"
-        lines = [f"🔒 {self.title} · {icon}" + (" · away" if STATE["away"] else "")]
+        lines = [f"🔒 {self.title} · {icon}" + (f" · {mode_label()}" if STATE["away"] else "")]
         others = len(SESSIONS) - 1
         if others > 0:
             lines.append(f"（另有 {others} 個 session，/to 可切換）")
@@ -362,6 +362,7 @@ def on_hook(ev: dict):
         if name == "UserPromptSubmit":
             prompt = (ev.get("prompt") or "").strip()
             if prompt and not prompt.startswith(AUTO_PREFIXES):  # 只有我實際打的字才算新的一回合
+                set_away(False, "auto")  # 在電腦端輸入 = 人在電腦前
                 s.start_turn(prompt)
                 refresh(s, now=True)
             elif s.prompt and s.status != "sent":  # 自動接續（委派回報等）：沿用原本的輸入與計時
@@ -418,7 +419,7 @@ def on_permission(ev: dict) -> dict:
         ring = s.pending is p and len(s.pendings) > 1  # 輪到下一筆待確認：重發卡片讓手機響
         s.pendings.remove(p)
         if not ok or p.result.get("fallback"):
-            s.note = "⌛ 手機未回應，改由電腦端確認" if not ok else "↪️ 已切換 session，改由電腦端確認"
+            s.note = "⌛ 手機未回應，改由電腦端確認" if not ok else p.result["fallback"]
             refresh(s, notify=ring, now=True)
             return {}
         res = p.result
@@ -482,7 +483,7 @@ def drop_session(s: Session):
         save_state()
     SESSIONS.pop(s.sid, None)
     for pend in s.pendings:
-        pend.resolve({"fallback": True})
+        pend.resolve({"fallback": "⚫ session 已結束"})
 
 
 HOOK_QUEUE: "queue.Queue[dict]" = queue.Queue()
@@ -611,7 +612,7 @@ def switch_lock(sid: str) -> str:
         return f"🔒 已經鎖定 {new.title}"
     if old:
         for pend in old.pendings:
-            pend.resolve({"fallback": True})
+            pend.resolve({"fallback": "↪️ 已切換 session，改由電腦端確認"})
         old.inbox.clear()
     STATE["target"] = sid
     save_state()
@@ -620,13 +621,31 @@ def switch_lock(sid: str) -> str:
     return f"🔒 已鎖定 {new.title}"
 
 
+def mode_label() -> str:
+    auto = "（自動）" if STATE.get("away_src") == "auto" else ""
+    return ("🚶 away" if STATE["away"] else "🪑 back") + auto
+
+
+def set_away(on: bool, src: str):
+    """切換 away/back。src：auto（依你從哪邊輸入自動判斷）或 manual（/away、/back）。
+    切回 back 時，手機上還沒按的權限確認改回電腦端。"""
+    if STATE["away"] == on and STATE.get("away_src") == src:
+        return
+    STATE["away"], STATE["away_src"] = on, src
+    save_state()
+    log.info("模式 → %s", mode_label())
+    s = locked()
+    if not on and s:
+        for pend in s.pendings:
+            pend.resolve({"fallback": "🪑 你回到電腦，改由電腦端確認"})
+    refresh_all()
+
+
 def on_command(chat_id, text: str):
     cmd = text.split()[0].split("@")[0].lower()
     with cond:
         if cmd in ("/away", "/back"):
-            STATE["away"] = cmd == "/away"
-            save_state()
-            refresh_all()
+            set_away(cmd == "/away", "manual")
             return notice(chat_id, "🚶 away：權限確認改到手機" if STATE["away"]
                           else "🪑 back：權限確認在電腦端")
         if cmd == "/to":
@@ -637,7 +656,7 @@ def on_command(chat_id, text: str):
         if cmd in ("/status", "/start", "/id"):
             t = locked()
             rows = [f"{'🔒' if s is t else '•'} {s.title}（{s.project}）· {s.label}" for s in SESSIONS.values()]
-            return notice(chat_id, f"{'🚶 away' if STATE['away'] else '🪑 back'}\n"
+            return notice(chat_id, f"{mode_label()}\n"
                           + ("\n".join(rows) or "沒有開著的 session"), ttl=30)
     notice(chat_id, "⚠️ 斜線指令（/clear、/compact…）無法從手機送出，請在電腦端執行")
 
@@ -647,6 +666,7 @@ def on_text(chat_id, text: str):
         s = locked()
         if not s:
             return notice(chat_id, "沒有鎖定的 session（插件安裝後開的 session 才會出現，或用 /to 選擇）")
+        set_away(True, "auto")  # 從手機輸入 = 人不在電腦前
         p = s.pending
         if p and p.questions:
             p.answer(text)
