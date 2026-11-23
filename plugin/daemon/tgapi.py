@@ -25,6 +25,11 @@ DEFAULTS = {
 }
 
 
+def unattended() -> bool:
+    """claude -p 等非互動 session：不連手機（asyncRewake 會讓 -p 卡住，也不該產生卡片）。"""
+    return os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") == "0"
+
+
 def config_paths():
     """依序讀取，後者覆蓋前者：插件資料夾 → repo 的 local/config.json（開發用）。"""
     return [DATA_DIR / "config.json", PLUGIN_ROOT.parent / "local" / "config.json"]

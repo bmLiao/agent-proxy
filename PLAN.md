@@ -19,6 +19,8 @@
 | 桌面 App 觸發 hooks | ⏳ 文件有寫，未實測 |
 | 手機輸入、排隊、away 權限按鈕（真實互動 session） | ✅ 2026-11-23 實測 |
 | 插件 `userConfig` 以環境變數傳給 daemon | ⏳ 未實測（另可用 config.json） |
+| `claude -p` 等非互動 session 不受影響（以 `CLAUDE_CODE_SESSION_ATTENDED=0` 判斷並略過） | ✅ 實測 |
+| 桌面 App 的 session 是否為 `ATTENDED=1` | ⏳ 未實測（若為 0 插件會略過它） |
 
 ## 3. 架構
 

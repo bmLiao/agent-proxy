@@ -299,6 +299,8 @@ def on_hook(ev: dict):
     if ev.get("agent_id"):  # 子代理內部事件不轉播
         return
     with cond:
+        if sid not in SESSIONS and name != "SessionStart":  # 只追蹤註冊過的（互動）session
+            return
         s = session(sid, ev.get("cwd") or "")
         if name == "UserPromptSubmit":
             prompt = (ev.get("prompt") or "").strip()
@@ -336,7 +338,9 @@ def on_permission(ev: dict) -> dict:
     """PermissionRequest：back 時立即交給電腦；away 時等手機決定（逾時退回電腦）。"""
     tool, inp = ev.get("tool_name") or "?", ev.get("tool_input") or {}
     with cond:
-        s = session(ev.get("session_id") or "?", ev.get("cwd") or "")
+        if ev.get("session_id") not in SESSIONS:  # 未註冊（例如 claude -p）→ 照常交給 CLI
+            return {}
+        s = session(ev.get("session_id"), ev.get("cwd") or "")
         if not STATE["away"]:
             s.note = f"🔐 電腦端等待確認：{clip(describe_tool(tool, inp), 150)}"
             refresh(s, now=True)

@@ -9,7 +9,7 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "daemon"))
-from tgapi import DATA_DIR, load_config  # noqa: E402
+from tgapi import DATA_DIR, load_config, unattended  # noqa: E402
 
 BASE = f"http://127.0.0.1:{load_config()['port']}"
 URL = BASE + "/hook"
@@ -53,6 +53,8 @@ def spawn():
 def main():
     body = sys.stdin.buffer.read() or b"{}"
     json.loads(body)
+    if unattended():
+        return
     info = get("/")
     if info and info.get("version") == VERSION and post(body):
         return

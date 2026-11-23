@@ -13,12 +13,12 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "daemon"))
-from tgapi import load_config  # noqa: E402
+from tgapi import load_config, unattended  # noqa: E402
 
 
 def main():
     ev = json.loads(sys.stdin.buffer.read() or b"{}")
-    if ev.get("agent_id"):
+    if ev.get("agent_id") or unattended():
         return 0
     query = urllib.parse.urlencode({"sid": ev.get("session_id", "?"), "cwd": ev.get("cwd", ""),
                                     "wid": secrets.token_hex(6)})
