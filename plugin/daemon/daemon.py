@@ -264,11 +264,13 @@ CARRY = {"inbox": [], "at": 0.0}  # 鎖定的 session 結束時還沒送出的�
 
 
 def lock_if_free(s: Session):
-    """沒有鎖定（第一次、或鎖定的已結束）時由這個 session 接手；已鎖定則不搶。
+    """沒有鎖定（第一次、或鎖定的已確實結束）時由這個 session 接手；已鎖定則不搶。
+    鎖定的 session 只是被判定成殘留（沒有 SessionEnd）時鎖定保留不放，只能等它回來或用 /to 換。
     接手時帶上前一個鎖定 session 沒送出的手機訊息（/clear 換新 session 時不會遺失），並立刻更新卡片。"""
-    if locked() is not None:
+    if STATE.get("target"):
         return
     STATE["target"] = s.sid
+    STATE.pop("target_pid", None)
     save_state()
     log.info("鎖定 session %s %s", s.sid[:8], s.project)
     if CARRY["inbox"] and time.time() - CARRY["at"] < 30:
@@ -370,10 +372,12 @@ def on_hook(ev: dict):
     if ev.get("agent_id"):  # 子代理內部事件不轉播
         return
     with cond:
-        if sid not in SESSIONS and name != "SessionStart":  # 只追蹤註冊過的（互動）session
+        # 只追蹤註冊過的（互動）session；被誤判成殘留移除的，有事件就回來
+        if sid not in SESSIONS and name != "SessionStart" and sid not in REAPED:
             return
         if sid in ENDED:
             return
+        REAPED.discard(sid)
         s = session(sid, ev.get("cwd") or "")
         s.last_event = time.time()
         s.transcript = ev.get("transcript_path") or s.transcript
@@ -476,7 +480,10 @@ def on_permission(ev: dict) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}
 
 
-ENDED: set = set()  # 已結束的 session，殘留的 waiter 不能把它復活
+ENDED: set = set()   # 確實結束（SessionEnd）的 session，殘留的 waiter 不能把它復活
+REAPED: set = set()  # 被 reaper 判定成殘留而移除的 session：可能是誤判，再有事件或 waiter 就恢復
+if STATE.get("target"):  # daemon 重啟前鎖定的 session：它的事件或 waiter 回來就恢復，鎖定照舊
+    REAPED.add(STATE["target"])
 
 
 def wait_phone(sid: str, wid: str, cwd: str, pid: int = 0, timeout: float = 50) -> dict:
@@ -485,7 +492,10 @@ def wait_phone(sid: str, wid: str, cwd: str, pid: int = 0, timeout: float = 50) 
     with cond:
         if sid in ENDED:
             return {"exit": True}
+        REAPED.discard(sid)
         s = session(sid, cwd)
+        if s.waiter != wid and (not s.waiter or pid != s.pid):  # 第一次或 PID 變了才記
+            log.info("waiter %s pid=%s", sid[:8], pid)
         s.pid = pid or s.pid
         if s.waiter != wid:
             s.waiter = wid
@@ -516,17 +526,19 @@ def _wait_loop(s: Session, sid: str, wid: str, end: float) -> dict:
             s.last_seen = time.time()
 
 
-def drop_session(s: Session):
-    """session 結束：鎖定中的話釋放鎖定；剛開的 session（例如 /clear 換的新 session）直接接手，
-    否則卡片標示已結束，等下一個開始活動的 session 接手。"""
+def drop_session(s: Session, ended: bool = True):
+    """session 結束（ended=True，收到 SessionEnd）：鎖定中的話釋放鎖定；剛開的 session（例如 /clear 換的新 session）
+    直接接手，否則卡片標示已結束，等下一個開始活動的 session 接手。
+    ended=False（reaper 判定成殘留，可能是誤判）：只移除，鎖定保留，其他窗口不會自動搶走。"""
     was_locked = s is locked()
-    ENDED.add(s.sid)
+    (ENDED if ended else REAPED).add(s.sid)
     SESSIONS.pop(s.sid, None)
     for pend in s.pendings:
         pend.resolve({"fallback": "⚫ session 已結束"})
-    if not was_locked:
+    if not was_locked or not ended:
         return
     STATE.pop("target", None)
+    STATE.pop("target_pid", None)
     CARRY["inbox"], CARRY["at"] = list(s.inbox), time.time()
     fresh = [x for x in SESSIONS.values() if time.time() - x.created < 15]
     if fresh:
@@ -668,6 +680,7 @@ def switch_lock(sid: str) -> str:
             pend.resolve({"fallback": "↪️ 已切換 session，改由電腦端確認"})
         old.inbox.clear()
     STATE["target"] = sid
+    STATE.pop("target_pid", None)
     save_state()
     log.info("切換鎖定 → %s %s", sid[:8], new.project)
     refresh(new, now=True)
@@ -788,14 +801,37 @@ def poll_loop():
 
 
 # ---------------------------------------------------------------- 生命週期
+def release_lost_lock(missing_since: float):
+    """鎖定的 session 不在 SESSIONS（被判定成殘留、或 daemon 重啟後還沒回來）時鎖定先保留；
+    確定它的 CLI 已關（PID 不在）、或不知道 PID 且 10 分鐘都沒回來，才放開讓下一個開始活動的 session 接手。"""
+    t = STATE.get("target")
+    s = SESSIONS.get(t)
+    if s:
+        if s.pid and STATE.get("target_pid") != s.pid:
+            STATE["target_pid"] = s.pid
+            save_state()
+        return
+    if not t:
+        return
+    pid = STATE.get("target_pid") or 0
+    if (pid and not pid_alive(pid)) or (not pid and time.time() - missing_since > 600):
+        log.info("鎖定的 session %s 已不在，放開鎖定", t[:8])
+        STATE.pop("target", None)
+        STATE.pop("target_pid", None)
+        save_state()
+
+
 def reaper():
     """清掉殘留 session（CLI 程序已不在；不知道 PID 時退回：閒置中 waiter 停止輪詢超過 30 秒，或 6 小時沒動靜）；
     沒有 session 超過 idle_exit 秒就結束。
     注意：送出手機訊息到下一個 Stop 之間本來就沒有 waiter（Claude 正在處理），不能當成視窗已關。"""
-    empty_since = time.time()
+    empty_since = missing_since = time.time()
     while True:
         time.sleep(30)
         with cond:
+            release_lost_lock(missing_since)
+            if STATE.get("target") in SESSIONS or not STATE.get("target"):
+                missing_since = time.time()
             for sid, s in list(SESSIONS.items()):
                 if s.pid:
                     gone = not pid_alive(s.pid)
@@ -804,7 +840,7 @@ def reaper():
                             and s.status not in ("busy", "sent", "bg")) or time.time() - s.last_seen > 6 * 3600
                 if gone:
                     log.info("移除殘留 session %s", sid[:8])
-                    safe(drop_session, s)
+                    safe(drop_session, s, False)
             if SESSIONS:
                 empty_since = time.time()
             cond.notify_all()

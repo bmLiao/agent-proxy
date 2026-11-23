@@ -93,6 +93,8 @@
 - `/to` 替換：舊 session 的待確認退回電腦、尚未送出的手機訊息作廢，卡片改顯示新 session
 - 鎖定的 session 結束：15 秒內新開的 session（例如 `/clear` 換的新 session id）直接接手，
   並帶上還沒送出的手機訊息；否則卡片標示已結束，下一個開始活動的 session 接手
+- 「結束」只認 SessionEnd，或確定 CLI 的 PID 已不在；只是被判定成殘留（例如等待程序停了）時鎖定保留，
+  其他窗口不會自動搶走，該 session 再有事件或 waiter 就恢復
 - CLI 視窗被直接關閉（沒有 SessionEnd）：waiter 偵測 Claude 行程已結束而退出，約 1–2 分鐘後清除並釋放鎖定
 
 ### 4.5 指令
