@@ -259,12 +259,24 @@ def locked():
     return SESSIONS.get(STATE.get("target"))
 
 
+CARRY = {"inbox": [], "at": 0.0}  # 鎖定的 session 結束時還沒送出的手機訊息，交給 30 秒內接手的 session
+
+
 def lock_if_free(s: Session):
-    """沒有鎖定（第一次、或鎖定的已結束）時由這個 session 接手；已鎖定則不搶。"""
-    if locked() is None:
-        STATE["target"] = s.sid
-        save_state()
-        log.info("鎖定 session %s %s", s.sid[:8], s.project)
+    """沒有鎖定（第一次、或鎖定的已結束）時由這個 session 接手；已鎖定則不搶。
+    接手時帶上前一個鎖定 session 沒送出的手機訊息（/clear 換新 session 時不會遺失），並立刻更新卡片。"""
+    if locked() is not None:
+        return
+    STATE["target"] = s.sid
+    save_state()
+    log.info("鎖定 session %s %s", s.sid[:8], s.project)
+    if CARRY["inbox"] and time.time() - CARRY["at"] < 30:
+        s.inbox = CARRY["inbox"] + s.inbox
+        if s.status in ("idle", "done"):
+            s.status, s.prompt = "sent", s.inbox[0]
+        cond.notify_all()
+    CARRY["inbox"] = []
+    refresh(s, now=True)
 
 
 CARD = {"dirty": False, "last_edit": 0.0}  # 整個聊天室只有一張卡，message_id 存在 STATE["card"]
@@ -512,10 +524,10 @@ def drop_session(s: Session):
     if not was_locked:
         return
     STATE.pop("target", None)
+    CARRY["inbox"], CARRY["at"] = list(s.inbox), time.time()
     fresh = [x for x in SESSIONS.values() if time.time() - x.created < 15]
     if fresh:
         lock_if_free(max(fresh, key=lambda x: x.created))
-        refresh(locked(), now=True)
     else:
         s.status, s.finished = "ended", s.finished or time.time()
         s.note = "下一個開始活動的 session 會自動接手，或用 /to 選擇"
