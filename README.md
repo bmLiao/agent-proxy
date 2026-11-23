@@ -23,7 +23,7 @@ Claude Code 插件。在手機上**監控、確認、輸入**電腦上已經開�
 
 ## 安裝
 
-需要 Python 3.9+（只用標準庫）與 Claude Code。
+需要 Python 3.9+（只用標準庫，hooks 以 `python3` 呼叫）與 Claude Code。
 
 1. `@BotFather` → `/newbot` 取得 bot token。
 2. 安裝插件：

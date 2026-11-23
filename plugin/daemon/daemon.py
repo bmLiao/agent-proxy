@@ -28,10 +28,11 @@ log = logging.getLogger("daemon")
 CFG = load_config()
 tg = TG(CFG["bot_token"])
 CHAT = (CFG["allowed_chat_ids"] or [None])[0]
-STATE_FILE = DATA_DIR / "state.json"  # {"away": bool, "target": 鎖定的 sid, "card": 卡片 message_id}
+STATE_FILE = DATA_DIR / "state.json"  # {"away": bool, "target": 鎖定的 sid, "card": 本次啟動的卡片 message_id}
 STATE = load_json(STATE_FILE, {})
 STATE.setdefault("away", False)
 STATE.pop("cards", None)
+STATE.pop("card", None)  # 只管這次啟動後開的那張卡；之前留下的舊卡不追究
 SEP = "━━━━━━━━━━━━"
 VERSION = code_version()  # 程式內容變了 ensure_daemon 才換掉舊的
 PHONE_PREFIX = "The user sent this message from their phone (Telegram); treat it as their prompt:\n"
@@ -386,6 +387,8 @@ def on_hook(ev: dict):
         elif name == "Notification":
             if ev.get("notification_type") == "idle_prompt" and s.status == "busy":
                 s.status, s.finished = "stopped", time.time()  # 沒有 Stop 就閒置：多半是 Esc 中斷
+                for pend in [x for x in s.pendings if not x.agent]:
+                    pend.resolve({"fallback": "⏹ 已停止，確認取消"})
                 refresh(s, now=True)
             elif ev.get("notification_type") not in ("idle_prompt", "permission_prompt") and s.prompt:
                 s.note = f"🔔 {clip(ev.get('message', ''), 200)}"
