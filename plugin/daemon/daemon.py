@@ -86,8 +86,9 @@ def describe_tool(name: str, inp: dict) -> str:
 
 # ---------------------------------------------------------------- 權限 / 提問
 class Pending:
-    def __init__(self, sid, tool, inp, suggestions):
+    def __init__(self, sid, tool, inp, suggestions, agent=None):
         self.rid, self.sid, self.tool, self.inp = secrets.token_hex(4), sid, tool, inp
+        self.agent = agent
         self.suggestions = suggestions or []
         self.questions = (inp.get("questions") or []) if tool == "AskUserQuestion" else []
         self.answers, self.qi = {}, 0
@@ -140,7 +141,7 @@ class Session:
         self.waiter = None          # 目前在長輪詢的 wait_phone id
         self.polls = 0              # 進行中的長輪詢數；CLI 被直接關掉時歸零，用來清掉殘留 session
         self.poll_end = time.time()
-        self.pending: Pending = None
+        self.pendings: list = []    # 待確認排隊（平行子代理可能同時要確認），卡片一次顯示第一筆
         self.msg_id = STATE["cards"].get(sid)
         self.dirty = False
         self.last_edit = 0.0
@@ -154,6 +155,10 @@ class Session:
     @property
     def busy(self) -> bool:  # 太久沒有事件（例如 Esc 中斷沒有 Stop）就不再視為忙碌
         return self.status == "busy" and time.time() - self.last_seen < 600
+
+    @property
+    def pending(self):
+        return self.pendings[0] if self.pendings else None
 
     @property
     def label(self) -> str:
@@ -186,7 +191,9 @@ class Session:
         if self.note:
             body.append(self.note)
         if self.pending:
-            body += ["", *self.pending.render()]
+            more = f"（還有 {len(self.pendings) - 1} 筆待確認）" if len(self.pendings) > 1 else ""
+            who = "🤖 子代理 " if self.pending.agent else ""
+            body += ["", who + more, *self.pending.render()] if who or more else ["", *self.pending.render()]
         if body:
             lines += [SEP, *body]
         text = clip("\n".join(lines), MAX_LEN)
@@ -297,7 +304,7 @@ def task_update(s: Session, tool: str, inp: dict, resp):
 
 def on_hook(ev: dict):
     name, sid = ev.get("hook_event_name", ""), ev.get("session_id") or "?"
-    log.info("hook %s %s %s", sid[:8], name,
+    log.info("hook %s%s %s %s", sid[:8], f" agent={ev['agent_id'][:8]}" if ev.get("agent_id") else "", name,
              ev.get("tool_name") or repr((ev.get("prompt") or "")[:80]) if name == "UserPromptSubmit" or ev.get("tool_name") else "")
     if ev.get("agent_id"):  # 子代理內部事件不轉播
         return
@@ -359,15 +366,17 @@ def on_permission(ev: dict) -> dict:
             s.note = f"🔐 電腦端等待確認：{clip(describe_tool(tool, inp), 150)}"
             refresh(s, now=True)
             return {}
-        p = s.pending = Pending(s.sid, tool, inp, ev.get("permission_suggestions"))
+        p = Pending(s.sid, tool, inp, ev.get("permission_suggestions"), ev.get("agent_id"))
+        s.pendings.append(p)
         log.info("權限請求 %s rid=%s tool=%s", s.sid[:8], p.rid, tool)
-        refresh(s, notify=True)
+        refresh(s, notify=s.pending is p, now=True)  # 排在後面的先不響，輪到時再響
     ok = p.event.wait(CFG["away_timeout"])
     with cond:
-        s.pending = None
+        ring = s.pending is p and len(s.pendings) > 1  # 輪到下一筆待確認：重發卡片讓手機響
+        s.pendings.remove(p)
         if not ok:
             s.note = "⌛ 手機未回應，改由電腦端確認"
-            refresh(s, now=True)
+            refresh(s, notify=ring, now=True)
             return {}
         res = p.result
         if res.get("behavior") == "allow":
@@ -382,7 +391,7 @@ def on_permission(ev: dict) -> dict:
         else:
             dec = {"behavior": "deny", "message": res.get("message", "")}
             s.note = "↩️ 已拒絕並改給指示" if res.get("said") else "❌ 已拒絕"
-        refresh(s, now=True)
+        refresh(s, notify=ring, now=True)
     return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}}
 
 
@@ -421,6 +430,7 @@ def _wait_loop(s: Session, sid: str, wid: str, end: float) -> dict:
 
 
 HOOK_QUEUE: "queue.Queue[dict]" = queue.Queue()
+LAST_EVENT = time.time()  # 任何 hook 事件（含未註冊的 claude -p）都算有人在用，daemon 不結束
 
 
 def hook_worker():
@@ -453,6 +463,8 @@ class Handler(BaseHTTPRequestHandler):
         if ev.get("hook_event_name") == "PermissionRequest":
             return self.reply(safe(on_permission, ev) or {})
         self.reply({})  # 不做決定、立即放行；處理在背景佇列
+        global LAST_EVENT
+        LAST_EVENT = time.time()
         HOOK_QUEUE.put(ev)
 
     def reply(self, obj: dict):
@@ -497,8 +509,9 @@ def send_long(chat_id, text: str):
 
 def find_pending(rid: str):
     for s in SESSIONS.values():
-        if s.pending and s.pending.rid == rid:
-            return s.pending
+        for p in s.pendings:
+            if p.rid == rid:
+                return p
     return None
 
 
@@ -646,7 +659,7 @@ def reaper():
             if SESSIONS:
                 empty_since = time.time()
             cond.notify_all()
-        if time.time() - empty_since > CFG["idle_exit"]:
+        if time.time() - max(empty_since, LAST_EVENT) > CFG["idle_exit"]:
             log.info("沒有 session，daemon 結束")
             os._exit(0)
 

@@ -1,4 +1,5 @@
-"""SessionStart hook：確保 daemon 在跑，並把這個事件轉給它。任何錯誤都安靜 exit 0。"""
+"""SessionStart hook：確保 daemon 在跑（HTTP hooks 才不會連線失敗），互動 session 再向它註冊。
+任何錯誤都安靜 exit 0。"""
 import json
 import os
 import pathlib
@@ -53,8 +54,8 @@ def spawn():
 def main():
     body = sys.stdin.buffer.read() or b"{}"
     json.loads(body)
-    if unattended():
-        return
+    if unattended():  # claude -p 等：只確保 daemon 在跑，不註冊（不產生卡片、不等手機訊息）
+        body = b'{"hook_event_name": "Ping"}'
     info = get("/")
     if info and info.get("version") == VERSION and post(body):
         return

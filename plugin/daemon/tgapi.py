@@ -20,7 +20,7 @@ DEFAULTS = {
     "port": 47821,
     "edit_interval": 3,       # 卡片 edit 最小間隔秒數
     "notify_on_done": True,   # 完成時刪卡重發（手機會響）；False 只 edit
-    "idle_exit": 600,         # 沒有任何 session 後幾秒自動結束
+    "idle_exit": 1800,        # 沒有 session 也沒有任何 hook 事件幾秒後自動結束
     "away_timeout": 600,      # away 時手機幾秒沒回應就退回電腦確認
 }
 
