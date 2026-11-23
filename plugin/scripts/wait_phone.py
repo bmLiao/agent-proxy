@@ -36,7 +36,9 @@ def main():
             time.sleep(2)
             continue
         if res.get("text"):
-            sys.stderr.write(res["text"])
+            # 以 UTF-8 位元組輸出：Windows 上 sys.stderr 預設是系統碼頁（cp950），中文會變亂碼
+            sys.stderr.buffer.write(res["text"].encode("utf-8"))
+            sys.stderr.buffer.flush()
             return 2
         if res.get("exit"):
             return 0
